@@ -1,0 +1,509 @@
+<!doctype html>
+
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <meta name="description" content="Plane detection from scratch">
+    <meta name="author" content="Konstantin Fedorov">
+    <title>Plane detection on example images</title>
+
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Sans:regular,bold|Inconsolata|PT+Sans:400,700">
+    <link rel="stylesheet" href="https://inspirit.github.io/jsfeat/css/bootstrap.css">
+    <link rel="stylesheet" href="https://inspirit.github.io/jsfeat/css/jsfeat.css">
+
+</head>
+<body>
+<video id="webcam" width="640" height="480" style="display:none;"></video>
+<div style=" width:640px;height:480px;margin: 10px auto;">
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="no_rtc" class="alert alert-error" style="display:none;"></div>
+    <div id="log" class="alert alert-info"></div>
+    <canvas id="canvas_img1" width="640" height="480"></canvas>
+    <canvas id="canvas_img2" width="640" height="480"></canvas>
+</div>
+
+<script src="https://cdn.bootcdn.net/ajax/libs/jquery/1.8.2/jquery.min.js"></script>
+<script type="text/javascript" src="https://inspirit.github.io/jsfeat/js/jsfeat-min.js"></script>
+<script type="text/javascript" src="https://inspirit.github.io/jsfeat/js/compatibility.js"></script>
+<script type="text/javascript" src="https://inspirit.github.io/jsfeat/js/profiler.js"></script>
+<script type="text/javascript" src="https://inspirit.github.io/jsfeat/js/dat.gui.min.js"></script>
+<script type="text/javascript" src="https://andriiheonia.github.io/hull/javascripts/hull.js"></script>
+<script type="text/javascript">
+
+    $(window).load(function() {
+        "use strict";
+
+        var canvas = document.getElementById('canvas');
+
+
+        let img1 = new Image();
+        let ctx_img1 = document.getElementById('canvas_img1').getContext('2d');
+        img1.onload = () => {
+            ctx_img1.drawImage(img1,0,0, 640, 480);
+        };
+        img1.src = "1_002.jpg";
+
+        let img2 = new Image();
+        img2.src = "1_003.jpg";
+        let ctx_img2 = document.getElementById('canvas_img2').getContext('2d');
+        img2.onload = () => {
+            ctx_img2.drawImage(img2,0,0, 640, 480);
+        };
+
+        var stat = new profiler();
+
+        // our point match structure
+        var match_t = (function () {
+            function match_t(screen_idx, pattern_lev, pattern_idx, distance) {
+                if (typeof screen_idx === "undefined") { screen_idx=0; }
+                if (typeof pattern_lev === "undefined") { pattern_lev=0; }
+                if (typeof pattern_idx === "undefined") { pattern_idx=0; }
+                if (typeof distance === "undefined") { distance=0; }
+
+                this.screen_idx = screen_idx;
+                this.pattern_lev = pattern_lev;
+                this.pattern_idx = pattern_idx;
+                this.distance = distance;
+            }
+            return match_t;
+        })();
+
+        var gui,options,ctx,canvasWidth,canvasHeight;
+        var img_u8, img_u8_smooth, screen_corners, num_corners, screen_descriptors;
+        var screen_corners2, num_corners2, screen_descriptors2;
+        var pattern_corners, pattern_descriptors, pattern_preview;
+        var matches, homo3x3, match_mask;
+        var match_mask_2, outlier_matches;
+
+        var Options = function(){
+            this.blur_size = 7;
+            this.lap_thres = 22;
+            this.eigen_thres = 14;
+            this.match_threshold = 48;
+            this.norm_threshold = 60;
+            this.max_keypoints = 500;
+
+            this.train_pattern = function() {};
+        };
+
+        App(640, 480);
+
+        function App(videoWidth, videoHeight) {
+            canvasWidth  = canvas.width;
+            canvasHeight = canvas.height;
+            ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = "rgb(0,255,0)";
+            ctx.strokeStyle = "rgb(0,255,0)";
+
+            img_u8 = new jsfeat.matrix_t(640, 480, jsfeat.U8_t | jsfeat.C1_t);
+            // after blur
+            img_u8_smooth = new jsfeat.matrix_t(640, 480, jsfeat.U8_t | jsfeat.C1_t);
+
+            screen_descriptors = new jsfeat.matrix_t(32, 500, jsfeat.U8_t | jsfeat.C1_t);
+            screen_descriptors2 = new jsfeat.matrix_t(32, 500, jsfeat.U8_t | jsfeat.C1_t);
+
+
+            pattern_preview = new jsfeat.matrix_t(img_u8.cols, img_u8.rows, jsfeat.U8_t | jsfeat.C1_t);
+
+            pattern_descriptors = [];
+
+            screen_corners = [];
+            screen_corners2 = [];
+            pattern_corners = [];
+            matches = [];
+            outlier_matches = [];
+
+            var i = 640*480;
+            while(--i >= 0) {
+                screen_corners[i] = new jsfeat.keypoint_t(0,0,0,0,-1);
+                screen_corners2[i] = new jsfeat.keypoint_t(0,0,0,0,-1);
+                matches[i] = new match_t();
+            }
+
+            // transform matrix
+            homo3x3 = new jsfeat.matrix_t(3,3,jsfeat.F32C1_t);
+            match_mask = new jsfeat.matrix_t(500,1,jsfeat.U8C1_t);
+            match_mask_2 = new jsfeat.matrix_t(500,1,jsfeat.U8C1_t);
+
+            options = new Options();
+            gui = new dat.GUI();
+
+            gui.add(options, "blur_size", 3, 9).step(1);
+            gui.add(options, "lap_thres", 1, 100);
+            gui.add(options, "eigen_thres", 1, 100);
+            // gui.add(options, "match_threshold", 16, 128);
+            gui.add(options, "max_keypoints", 100, 1000).step(1);
+            gui.add(options, "norm_threshold", 20, Math.ceil(Math.sqrt(640*640 + 480*480))).step(20);
+
+            stat.add("grayscale");
+            stat.add("gauss blur");
+            stat.add("keypoints");
+            stat.add("orb descriptors");
+            stat.add("matching");
+        }
+
+        let frameSeq = [];
+
+        setInterval(tick, 50);
+
+        function tick() {
+            // compatibility.requestAnimationFrame(tick);
+            stat.new_frame();
+            let img1Data = ctx_img1.getImageData(0, 0, 640, 480);
+            let img2Data = ctx_img2.getImageData(0, 0, 640, 480);
+
+            let img1_u8 = new jsfeat.matrix_t(640, 480, jsfeat.U8_t | jsfeat.C1_t);
+            let img1_u8_smooth = new jsfeat.matrix_t(640, 480, jsfeat.U8_t | jsfeat.C1_t);
+
+            stat.start("grayscale");
+            jsfeat.imgproc.grayscale(img1Data.data, 640, 480, img1_u8);
+            stat.stop("grayscale");
+
+            stat.start("gauss blur");
+            jsfeat.imgproc.gaussian_blur(img1_u8, img1_u8_smooth, options.blur_size|0);
+            stat.stop("gauss blur");
+
+            let img2_u8 = new jsfeat.matrix_t(640, 480, jsfeat.U8_t | jsfeat.C1_t);
+            let img2_u8_smooth = new jsfeat.matrix_t(640, 480, jsfeat.U8_t | jsfeat.C1_t);
+
+            stat.start("grayscale");
+            jsfeat.imgproc.grayscale(img2Data.data, 640, 480, img2_u8);
+            stat.stop("grayscale");
+
+            stat.start("gauss blur");
+            jsfeat.imgproc.gaussian_blur(img2_u8, img2_u8_smooth, options.blur_size|0);
+            stat.stop("gauss blur");
+
+            frameSeq = [img1_u8_smooth, img2_u8_smooth];
+
+            ctx.drawImage(img1, 0, 0, 640, 480);
+            ctx.globalAlpha = 0.5;
+            ctx.drawImage(img2, 0, 0, 640, 480);
+
+            var imageData = ctx.getImageData(0, 0, 640, 480);
+
+            jsfeat.yape06.laplacian_threshold = options.lap_thres|0;
+            jsfeat.yape06.min_eigen_value_threshold = options.eigen_thres|0;
+
+            frameSeq.forEach((val, ind) => {
+                stat.start("keypoints");
+                let num = detect_keypoints(val, ind ? screen_corners : screen_corners2, options.max_keypoints|500);
+                if (ind) {
+                    num_corners = num;
+                } else {
+                    num_corners2 = num;
+                }
+                stat.stop("keypoints");
+
+                stat.start("orb descriptors");
+                jsfeat.orb.describe(val, ind ? screen_corners : screen_corners2, ind ? num_corners : num_corners2, ind ? screen_descriptors : screen_descriptors2);
+                stat.stop("orb descriptors");
+            }, frameSeq);
+
+            // render result back to canvas
+            var data_u32 = new Uint32Array(imageData.data.buffer);
+
+            render_corners(screen_corners2, num_corners2, data_u32, 640, true);
+            ctx.putImageData(imageData, 0, 0);
+            render_corners(screen_corners, num_corners, data_u32, 640, false);
+            ctx.putImageData(imageData, 0, 0);
+
+            // render pattern and matches
+            var num_matches = 0;
+            var good_matches = 0;
+            render_mono_image(pattern_preview.data, data_u32, pattern_preview.cols, pattern_preview.rows, 640);
+            stat.start("matching");
+            num_matches = custom_match_pattern();
+            good_matches = custom_find_transform(matches, num_matches);
+            // outlier_matches = [];
+            // if (good_matches) {
+            //     for (let i = 0; i < num_matches; ++i) {
+            //         if (!match_mask.data[i]) {
+            //             outlier_matches.push(matches[i]);
+            //         }
+            //     }
+            // }
+            // let another_good_matches = custom_find_transform(outlier_matches, num_matches - good_matches, num_matches);
+            stat.stop("matching");
+
+            if(num_matches) {
+                custom_render_matches(ctx, matches, num_matches);
+                if(good_matches > 8)
+                    custom_render_pattern_shape(ctx, num_matches, good_matches);
+                // if (another_good_matches > 8) {
+                //     custom_render_pattern_shape(ctx, num_matches, another_good_matches, true);
+                // }
+            }
+
+            $('#log').html(stat.log());
+        }
+
+        // UTILITIES
+
+        function detect_keypoints(img, corners, max_allowed) {
+            // detect features
+            var count = jsfeat.yape06.detect(img, corners, 35);
+            // var count = jsfeat.fast_corners.detect(img, corners, 25);
+
+            // sort by score and reduce the count if needed
+            if(count > max_allowed) {
+                jsfeat.math.qsort(corners, 0, count-1, function(a,b){return (b.score<a.score);});
+                count = max_allowed;
+            }
+
+            // calculate dominant orientation for each keypoint
+            for(var i = 0; i < count; ++i) {
+                corners[i].angle = ic_angle(img, corners[i].x, corners[i].y);
+            }
+
+            return count;
+        }
+
+        // central difference using image moments to find dominant orientation
+        var u_max = new Int32Array([15,15,15,15,14,14,14,13,13,12,11,10,9,8,6,3,0]);
+        function ic_angle(img, px, py) {
+            var half_k = 15; // half patch size
+            var m_01 = 0, m_10 = 0;
+            var src=img.data, step=img.cols;
+            var u=0, v=0, center_off=(py*step + px)|0;
+            var v_sum=0,d=0,val_plus=0,val_minus=0;
+
+            // Treat the center line differently, v=0
+            for (u = -half_k; u <= half_k; ++u)
+                m_10 += u * src[center_off+u];
+
+            // Go line by line in the circular patch
+            for (v = 1; v <= half_k; ++v) {
+                // Proceed over the two lines
+                v_sum = 0;
+                d = u_max[v];
+                for (u = -d; u <= d; ++u) {
+                    val_plus = src[center_off+u+v*step];
+                    val_minus = src[center_off+u-v*step];
+                    v_sum += (val_plus - val_minus);
+                    m_10 += u * (val_plus + val_minus);
+                }
+                m_01 += v * v_sum;
+            }
+
+            return Math.atan2(m_01, m_10);
+        }
+
+        // estimate homography transform between matched points
+        function custom_find_transform(matches, count, isAnotherWithNumMatches) {
+            if (matches.length === 0) {
+                return 0;
+            }
+            // motion kernel
+            var mm_kernel = new jsfeat.motion_model.homography2d();
+            // ransac params
+            var num_model_points = isAnotherWithNumMatches ? ((isAnotherWithNumMatches-count)/2)  : 4; // minimum points to estimate motion
+            var reproj_threshold = 3; // max error to classify as inliner
+            var eps = 0.5; // max outliers ratio
+            var prob = 0.99; // probability of success
+            var ransac_param = new jsfeat.ransac_params_t(num_model_points,
+                reproj_threshold, eps, prob);
+
+            var pattern_xy = [];
+            var screen_xy = [];
+
+            // construct correspondences
+            for(var i = 0; i < count; ++i) {
+                var m = matches[i];
+                var s_kp = screen_corners[m.screen_idx];
+                var p_kp = screen_corners2[m.pattern_idx];
+                pattern_xy[i] = {"x":p_kp.x, "y":p_kp.y};
+                screen_xy[i] =  {"x":s_kp.x, "y":s_kp.y};
+            }
+
+            // estimate motion
+            var ok = false;
+            var max_iter = 200000; // 1000;
+            ok = jsfeat.motion_estimator.ransac(ransac_param, mm_kernel,
+                pattern_xy, screen_xy, count, homo3x3, isAnotherWithNumMatches ? match_mask_2 : match_mask, max_iter);
+
+            // extract good matches and re-estimate
+            var good_cnt = 0;
+            if(ok) {
+                for(var i=0; i < count; ++i) {
+                    if((isAnotherWithNumMatches ? match_mask_2 : match_mask).data[i]) {
+                        pattern_xy[good_cnt].x = pattern_xy[i].x;
+                        pattern_xy[good_cnt].y = pattern_xy[i].y;
+                        screen_xy[good_cnt].x = screen_xy[i].x;
+                        screen_xy[good_cnt].y = screen_xy[i].y;
+                        good_cnt++;
+                    }
+                }
+                // run kernel directly with inliers only
+                mm_kernel.run(pattern_xy, screen_xy, homo3x3, good_cnt);
+            } else {
+                jsfeat.matmath.identity_3x3(homo3x3, 1.0);
+            }
+            if (count !== good_cnt) {
+                console.log(count, good_cnt);
+            }
+
+            return good_cnt;
+        }
+
+        // non zero bits count
+        function popcnt32(n) {
+            n -= ((n >> 1) & 0x55555555);
+            n = (n & 0x33333333) + ((n >> 2) & 0x33333333);
+            return (((n + (n >> 4))& 0xF0F0F0F)* 0x1010101) >> 24;
+        }
+
+        // naive brute-force matching.
+        // each on screen point is compared to all pattern points
+        // to find the closest match
+        function custom_match_pattern() {
+            var q_cnt = screen_descriptors.rows;
+            var query_du8 = screen_descriptors.data;
+            var query_u32 = screen_descriptors.buffer.i32; // cast to integer buffer
+            var qd_off = 0;
+            var qidx=0,lev=0,pidx=0,k=0;
+            var num_matches = 0;
+
+            for(qidx = 0; qidx < q_cnt; ++qidx) {
+                var best_dist = 256;
+                var best_dist2 = 256;
+                var best_idx = -1;
+                var best_lev = -1;
+
+                var best_norm = 480.0*640;
+                // var best_norm2 = 480.0*640;
+
+                var lev_descr = screen_descriptors2;
+                var ld_cnt = lev_descr.rows;
+                var ld_i32 = lev_descr.buffer.i32; // cast to integer buffer
+                var ld_off = 0;
+
+                for(pidx = 0; pidx < ld_cnt; ++pidx) {
+
+                    var curr_d = 0;
+                    // our descriptor is 32 bytes so we have 8 Integers
+                    for(k=0; k < 8; ++k) {
+                        curr_d += popcnt32( query_u32[qd_off+k]^ld_i32[ld_off+k] );
+                    }
+
+
+                    if(curr_d < best_dist
+                        // && cur_norm < best_norm
+                    ) {
+                        best_dist2 = best_dist;
+                        best_dist = curr_d;
+                        best_lev = lev;
+                        best_idx = pidx;
+
+                        // best_norm2 = best_norm;
+                        best_norm = Math.sqrt(Math.pow(screen_corners[qidx].x - screen_corners2[best_idx].x, 2) + Math.pow(screen_corners[qidx].y - screen_corners2[best_idx].y, 2));
+                    } else if(curr_d < best_dist2
+                        // && cur_norm < best_norm2
+                    ) {
+                        best_dist2 = curr_d;
+                        // best_norm2 = cur_norm;
+                    }
+
+                    ld_off += 8; // next descriptor
+                }
+
+                // filter out by some threshold
+                // if(best_dist < options.match_threshold) {
+                //     matches[num_matches].screen_idx = qidx;
+                //     matches[num_matches].pattern_lev = best_lev;
+                //     matches[num_matches].pattern_idx = best_idx;
+                //     num_matches++;
+                // }
+
+
+                // /* filter using the ratio between 2 closest matches
+                if(best_dist < 0.7*best_dist2 && best_norm < options.norm_threshold) {
+                    matches[num_matches].screen_idx = qidx;
+                    matches[num_matches].pattern_lev = best_lev;
+                    matches[num_matches].pattern_idx = best_idx;
+                    num_matches++;
+                }
+                // */
+
+                qd_off += 8; // next query descriptor
+            }
+
+            return num_matches;
+        }
+        function custom_render_matches(ctx, matches, count) {
+            for(var i = 0; i < count; ++i) {
+                var m = matches[i];
+                var s_kp = screen_corners[m.screen_idx];
+                var p_kp = screen_corners2[m.pattern_idx];
+                if(match_mask.data[i]) {
+                    ctx.strokeStyle = "rgb(0,255,0)";
+                }
+                else {
+                    ctx.strokeStyle = "rgb(255,0,0)";
+                }
+                ctx.beginPath();
+                ctx.moveTo(s_kp.x,s_kp.y);
+                ctx.lineTo(p_kp.x, p_kp.y);
+                ctx.lineWidth=1;
+                ctx.stroke();
+            }
+        }
+        var pointset;
+        function custom_render_pattern_shape(ctx, count_matches, good_matches, isAnother) {
+            pointset = [];
+            for (let i = 0; i < (isAnother ? match_mask_2.data.length : match_mask.data.length); ++i) {
+                if ((isAnother ? match_mask_2 : match_mask).data[i]) {
+                    var m = matches[i];
+                    var s_kp = screen_corners[m.screen_idx];
+                    pointset.push([s_kp.x, s_kp.y]);
+                }
+            }
+            var pts = hull(pointset, 500);
+
+            ctx.strokeStyle = "rgb(0,255,0)";
+            ctx.beginPath();
+
+            pts.forEach(function(px) {
+                ctx.lineTo(px[0], px[1]);
+                ctx.moveTo(px[0], px[1]);
+            });
+
+            ctx.lineWidth=4;
+            ctx.stroke();
+        }
+
+        function render_corners(corners, count, img, step, type) {
+            var pix = type ? ((0xff << 24) | (0x00 << 16) | (0x00 << 8) | 0xff) : ((0xff << 24) | (0x00 << 16) | (0xff << 8) | 0x00);
+            for(var i=0; i < count; ++i)
+            {
+                var x = corners[i].x;
+                var y = corners[i].y;
+                var off = (x + y * step);
+                img[off] = pix;
+                img[off-1] = pix;
+                img[off+1] = pix;
+                img[off-step] = pix;
+                img[off+step] = pix;
+            }
+        }
+
+        function render_mono_image(src, dst, sw, sh, dw) {
+            var alpha = (0xff << 24);
+            for(var i = 0; i < sh; ++i) {
+                for(var j = 0; j < sw; ++j) {
+                    var pix = src[i*sw+j];
+                    dst[i*dw+j] = alpha | (pix << 16) | (pix << 8) | pix;
+                }
+            }
+        }
+
+        $(window).unload(function() {
+            video.pause();
+            video.src=null;
+        });
+    });
+</script>
+</body>
+</html>
